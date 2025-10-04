@@ -1,110 +1,118 @@
+#define BLYNK_TEMPLATE_ID "TMPL6pU_4ifNy"
+#define BLYNK_TEMPLATE_NAME "Landar"
+#define BLYNK_AUTH_TOKEN "3lM8hyfL_UbuU9GG520Sw-ORasbQIxBR"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
 #include "DHT.h"
+#include <ArduinoJson.h>
 
-#define DHTPIN A1
-#define DHTTYPE DHT11 
+char auth[] = BLYNK_AUTH_TOKEN;
+char ssid[] = "YourWiFiName";
+char pass[] = "YourWiFiPass";
 
-uint8_t buffer[32];
-int airQ;
+
+#define DHTPIN 15
+#define DHTTYPE DHT11
+#define AIRQ_PIN 34
+#define WIND_PIN 4
+
 DHT dht(DHTPIN, DHTTYPE);
-unsigned long lastDebounceTime = 0;  
-unsigned long debounceDelay = 1000;    
 
-const int pinInterrupt = 2;  // chân ngắt
-volatile int Count = 0;      // volatile để an toàn trong ISR
+volatile int Count = 0;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 1000;
 
-void onChange() {
-  if (digitalRead(pinInterrupt) == LOW) {
+uint16_t pm2_5, pm10;
+uint8_t buffer[32];
+float windSpeed;
+int airQ;
+
+void IRAM_ATTR onChange() {
+  if (digitalRead(WIND_PIN) == LOW) {
     Count++;
   }
 }
 
-void setup() {  
-  Serial.begin(9600);  
-  Serial1.begin(9600);     // Connects to ZH03B
-  dht.begin();      
+bool readZH03B(uint16_t &pm2_5, uint16_t &pm10) {
+  if (Serial2.available() >= 32) {
+    // Read 32-byte frame
+    uint8_t frame[32];
+    Serial2.readBytes(frame, 32);
 
-  pinMode(pinInterrupt, INPUT_PULLUP);
+    // Check header
+    if (frame[0] != 0x42 || frame[1] != 0x4D) {
+      return false; // Invalid start
+    }
 
-  // Enable interrupt
-  attachInterrupt(digitalPinToInterrupt(pinInterrupt), onChange, FALLING);
+    // Compute checksum
+    uint16_t sum = 0;
+    for (int i = 0; i < 30; i++) {
+      sum += frame[i];
+    }
+    uint16_t checksum = (frame[30] << 8) | frame[31];
+    if (sum != checksum) {
+      return false; // Invalid
+    }
 
+    // Extract PM2.5 and PM10 (ug/m³)
+    pm2_5 = (frame[12] << 8) | frame[13];
+    pm10  = (frame[14] << 8) | frame[15];
+
+    return true; // Success
+  }
+  return false; // Not enough
 }
 
+void setup() {
+  Serial.begin(115200);      // Debug
+  Serial2.begin(9600, SERIAL_8N1, 16, 17); // RX=16, TX=17
+
+  pinMode(WIND_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(WIND_PIN), onChange, FALLING);
+
+  dht.begin();
+
+  Blynk.begin(auth, ssid, pass);
+}
+
+
 void loop() {
-  Serial.println();
-  delay(2000);  // 2s delay (ZH03B outputs 1Hz anyway)
+  Blynk.run();
 
-  // ---- Air Quality analog sensor ----
-  airQ = analogRead(A0);       
-  Serial.print("Air Quality = ");
-  Serial.print(airQ, DEC);            
-  Serial.println(" PPM");
+  // Read air quality
+  airQ = analogRead(AIRQ_PIN);
 
-  // ---- Humidity and temperature ----
+  // DHT
   float humid = dht.readHumidity();
-  float temp  = dht.readTemperature(); // Celsius
-  Serial.print("Humidity: ");
-  Serial.print(humid);
-  Serial.print("%\tTemperature: ");
-  Serial.print(temp);
-  Serial.println(" °C");
+  float temp  = dht.readTemperature();
 
+  // Wind speed
   if ((millis() - lastDebounceTime) > debounceDelay) {
     lastDebounceTime = millis();
-
-    float windSpeed = (Count * 8.75) / 100.0;  // đổi sang float cho chính xác
-    Serial.print("Windspeed: ");
-    Serial.print(windSpeed);
-    Serial.println(" m/s");
-
-
+    windSpeed = (Count * 8.75) / 100.0;
     Count = 0;
   }
 
-  // ---- ZH03B ----
-  if (Serial1.available() >= 32) {
-    Serial.println("Passed");
-    while (Serial1.available() > 0) {
-      if (Serial1.peek() == 0x42) {   // Check header start
-        Serial1.read();               // Consume 0x42
-        if (Serial1.peek() == 0x4D) {
-          Serial1.read();             // Consume 0x4D
+  if (readZH03B(pm2_5, pm10)) {
+    Serial.print("PM2.5: ");
+    Serial.print(pm2_5);
+    Serial.print(" µg/m³ | PM10: ");
+    Serial.print(pm10);
+    Serial.println(" µg/m³");
 
-          // Read rest of frame
-          buffer[0] = 0x42;
-          buffer[1] = 0x4D;
-          Serial1.readBytes(buffer + 2, 30);
+  // Send to Blynk
+  Blynk.virtualWrite(V0, airQ);
+  Blynk.virtualWrite(V1, humid);
+  Blynk.virtualWrite(V2, temp);
+  Blynk.virtualWrite(V3, windSpeed);
+  Blynk.virtualWrite(V4, pm2_5);
+  Blynk.virtualWrite(V5, pm10);
 
-          // Verify checksum
-          uint16_t sum = 0;
-          for (int i = 0; i < 30; i++) {
-            sum += buffer[i];
-          }
-          uint16_t checksum = (buffer[30] << 8) | buffer[31];
-
-          if (sum == checksum) {
-            // ✅ Valid frame
-            uint16_t pm2_5 = (buffer[12] << 8) | buffer[13];
-            uint16_t pm10  = (buffer[14] << 8) | buffer[15];
-
-            Serial.print("PM2.5: ");
-            Serial.print(pm2_5);
-            Serial.print(" µg/m³ | PM10: ");
-            Serial.print(pm10);
-            Serial.println(" µg/m³");
-          } else {
-            Serial.println("⚠️ Bad checksum, discarding frame!");
-          }
-          break;  // Exit loop after one good (or bad) frame
-        } else {
-          Serial1.read(); // Not 0x4D, discard
-        }
-      } else {
-        Serial1.read(); // Discard until we hit 0x42
-      }
-    }
-  }
+  delay(2000);
 }
+
 
 
 
